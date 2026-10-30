@@ -1,0 +1,32 @@
+---
+code: true
+type: page
+title: test | Framework | Core
+
+description: Koncorde.test method
+---
+
+# `test()`
+
+<DeprecatedBadge version="2.14.0" />
+
+Tests data and returns the matching filter identifiers.
+
+### Arguments
+
+```js
+test(index: string, collection: string, data: JSONObject, id?: string): string[];
+```
+
+<br/>
+
+| Arguments    | Type              | Description                |
+|--------------|-------------------|----------------------------|
+| `index`      | <pre>string</pre> | Index name                 |
+| `collection` | <pre>string</pre> | Collection name            |
+| `data`       | <pre>any</pre>    | Data to test               |
+| `id`         | <pre>string</pre> | Optional document unique identifier |
+
+### Return
+
+The `test` function returns an array of strings, which is the exhaustive list of matching filter identifiers.

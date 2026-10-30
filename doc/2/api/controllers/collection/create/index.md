@@ -1,0 +1,229 @@
+---
+code: true
+type: page
+title: create | API | Core
+---
+
+# create
+
+Creates a new [collection](/core/2/guides/main-concepts/data-storage), in the provided `index`.
+
+Collection names must meet the following criteria:
+
+* Lowercase only
+* Cannot include one of the following characters: `\\`, `/`, `*`, `?`, `"`, `<`, `>`, `|`, ` ` (space character), `,`, `#`, `:`, `%`, `&`, `.`
+* Cannot be longer than 126 bytes (note it is bytes, so multi-byte characters will count towards the 126 limit faster)
+
+You can also provide an optional body with a [collection mapping](/core/2/guides/main-concepts/data-storage#collection-mappings) allowing you to exploit the full capabilities of our persistent data storage layer.
+
+When the collection already exists, its settings and then its mappings are updated with the ones provided, as with [collection:update](/core/2/api/controllers/collection/update).
+
+<SinceBadge version="2.60.0"/>
+
+Before updating an existing collection, Kuzzle waits for its primary shards to be active, for up to 30 seconds: a collection just created by another request (or another node) may not be ready yet. If the shards are still not active after that delay, the request fails with a `services.storage.unexpected_error` error.
+The same applies when two requests create the same collection concurrently: the one that loses the race updates the collection instead, so the mappings and settings of both requests are applied.
+
+You can define the collection [dynamic mapping policy](/core/2/guides/main-concepts/data-storage#mappings-dynamic-policy) by setting the `dynamic` field to the desired value.
+
+You can define [collection additional metadata](/core/2/guides/main-concepts/data-storage#mappings-metadata) within the `_meta` root field.
+
+<SinceBadge version="2.1.0"/>
+
+You can also provide Elasticsearch index [settings](https://www.elastic.co/guide/en/elasticsearch/reference/7.5/index-modules.html#index-modules-settings) when creating a new collection.
+
+---
+
+## Query Syntax
+
+### HTTP
+
+```http
+URL: http://kuzzle:7512/<index>/<collection>
+Method: PUT
+Body:
+```
+
+<SinceBadge version="2.1.0"/>
+
+```js
+{
+  "mappings": {
+    "dynamic": "[true|false|strict]", // boolean are also accepted
+    "_meta": {
+      "field": "value"
+    },
+    "properties": {
+      "field1": {
+        "type": "integer"
+      },
+      "field2": {
+        "type": "keyword"
+      },
+      "field3": {
+        "type":   "date",
+        "format": "yyyy-MM-dd HH:mm:ss||yyyy-MM-dd||epoch_millis"
+      }
+    }
+  },
+  "settings": {
+    "analysis" : {
+      "analyzer":{
+        "content":{
+          "type":"custom",
+          "tokenizer":"whitespace"
+        }
+      }
+    }
+  }
+}
+```
+
+<DeprecatedBadge version="2.1.0"/>
+
+```js
+{
+  "dynamic": "[false|true|strict]",
+  "_meta": {
+    "field": "value"
+  },
+  "properties": {
+    "field1": {
+      "type": "integer"
+    },
+    "field2": {
+      "type": "keyword"
+    },
+    "field3": {
+      "type":   "date",
+      "format": "yyyy-MM-dd HH:mm:ss||yyyy-MM-dd||epoch_millis"
+    }
+  }
+}
+```
+
+### Other protocols
+
+<SinceBadge version="2.1.0"/>
+
+```js
+{
+  "index": "<index>",
+  "collection": "<collection>",
+  "controller": "collection",
+  "action": "create",
+  "body": {
+    "mappings": {
+      "dynamic": "[true|false|strict]", // boolean are also accepted
+      "_meta": {
+        "field": "value"
+      },
+      "properties": {
+        "field1": {
+          "type": "integer"
+        },
+        "field2": {
+          "type": "keyword"
+        },
+        "field3": {
+          "type":   "date",
+          "format": "yyyy-MM-dd HH:mm:ss||yyyy-MM-dd||epoch_millis"
+        }
+      }
+    },
+    "settings": {
+      "analysis" : {
+        "analyzer":{
+          "content":{
+            "type":"custom",
+            "tokenizer":"whitespace"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+<DeprecatedBadge version="2.1.0"/>
+
+```js
+{
+  "index": "<index>",
+  "collection": "<collection>",
+  "controller": "collection",
+  "action": "create",
+  "body": {
+    "dynamic": "[true|false|strict]",
+    "_meta": {
+      "field": "value"
+    },
+    "properties": {
+      "field1": {
+        "type": "integer"
+      },
+      "field2": {
+        "type": "keyword"
+      },
+      "field3": {
+        "type":   "date",
+        "format": "yyyy-MM-dd HH:mm:ss||yyyy-MM-dd||epoch_millis"
+      }
+    }
+  }
+}
+```
+
+
+---
+
+## Arguments
+
+- `collection`: name of the collection to create
+- `index`: index name
+
+---
+
+## Body properties
+
+### Optional:
+
+<SinceBadge version="2.1.0"/>
+
+* `settings`: Elasticsearch index [settings](https://www.elastic.co/guide/en/elasticsearch/reference/7.5/index-modules.html#index-modules-settings)
+* `mappings`: [collection mappings](/core/2/guides/main-concepts/data-storage#mappings-properties)
+
+<DeprecatedBadge version="2.1.0"/>
+
+* `dynamic`: [dynamic mapping policy](/core/2/guides/main-concepts/data-storage#mappings-dynamic-policy) for new fields. Allowed string values: `true` (default), `false`, `strict` or a boolean
+* `_meta`: [collection additional metadata](/core/2/guides/main-concepts/data-storage#mappings-metadata) stored next to the collection
+* `properties`: object describing the data mapping to associate to the new collection, using [Elasticsearch types definitions format](/core/2/guides/main-concepts/data-storage#mappings-properties)
+
+---
+
+## Response
+
+Returns a confirmation that the collection has been created (or updated):
+
+```js
+{
+  "status": 200,
+  "error": null,
+  "index": "<index>",
+  "collection": "<collection>",
+  "controller": "collection",
+  "action": "create",
+  "requestId": "<unique request identifier>",
+  "result": {
+    "acknowledged": true
+  }
+}
+```
+
+---
+
+## Possible errors
+
+- [Common errors](/core/2/api/errors/types#common-errors)
+- [PreconditionError](/core/2/api/errors/types#preconditionerror)
+- [ExternalServiceError](/core/2/api/errors/types#externalserviceerror): the primary shards of an existing collection are still not active after 30 seconds (`services.storage.unexpected_error`)
+

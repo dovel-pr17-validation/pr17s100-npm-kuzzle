@@ -1,0 +1,194 @@
+// sync messages definitions
+// /!\ ALL messages must have a "messageId" property
+// /!\ Every singular scalar field is "optional": protobufjs 8 otherwise drops a
+//     field holding its default value ("", 0, false) on encode and in
+//     toObject(), where protobufjs 7 kept it. "optional" keeps the bytes and
+//     the decoded objects identical between both versions, which a cluster
+//     mixing them during a rolling upgrade relies on. Declare new fields the
+//     same way (tests/cluster/protobufWireCompat.test.ts checks the result).
+package sync;
+
+syntax="proto3";
+
+message Heartbeat {
+  optional uint64 messageId = 1;
+  optional string address = 2;
+}
+
+message NodeEvicted {
+  optional uint64 messageId = 1;
+  optional string nodeId = 2;
+  optional string reason = 3;
+  optional string evictor = 4;
+}
+
+message NodeShutdown {
+  optional uint64 messageId = 1;
+  optional string nodeId = 2;
+}
+
+message NodePreventEviction {
+  optional uint64 messageId = 1;
+  optional bool evictionPrevented = 2;
+}
+
+message NewRealtimeRoom {
+  optional uint64 messageId = 1;
+  optional string index = 2;
+  optional string id = 3;
+
+  // serialized JSON
+  optional string filter = 4;
+}
+
+message RemoveRealtimeRoom {
+  optional uint64 messageId = 1;
+  optional string roomId = 2;
+}
+
+message Subscription {
+  optional uint64 messageId = 1;
+  optional string roomId = 2;
+}
+
+message Unsubscription {
+  optional uint64 messageId = 1;
+  optional string roomId = 2;
+}
+
+message DocumentNotification {
+  optional uint64 messageId = 1;
+  repeated string rooms = 2;
+  optional uint32 status = 3;
+  optional string requestId = 4;
+  optional uint64 timestamp = 5;
+  optional string index = 6;
+  optional string collection = 7;
+  optional string controller = 8;
+  optional string action = 9;
+  optional string protocol = 10;
+  optional string scope = 11;
+
+  // serialized JSON
+  optional string volatile = 12;
+  optional string result = 13;
+}
+
+message UserNotification {
+  optional uint64 messageId = 1;
+  optional string room = 2;
+  optional uint32 status = 3;
+  optional uint64 timestamp = 4;
+  optional string index = 5;
+  optional string collection = 6;
+  optional string controller = 7;
+  optional string action = 8;
+  optional string protocol = 9;
+  optional string user = 10;
+
+  // serialized JSON
+  optional string volatile = 11;
+  optional string result = 12;
+}
+
+message NewAuthStrategy {
+  message AuthStrategyConfig {
+    optional string authenticator = 1;
+    repeated string fields = 2;
+
+    // serialized JSON
+    optional string authenticateOptions = 3;
+    optional string strategyOptions = 4;
+  }
+
+  message AuthStrategyMethods {
+    optional string create = 1;
+    optional string delete = 2;
+    optional string exists = 3;
+    optional string update = 4;
+    optional string validate = 5;
+    optional string verify = 6;
+    optional string getById = 7;
+    optional string getInfo = 8;
+    optional string afterRegister = 9;
+  }
+
+  message AuthStrategy {
+    AuthStrategyMethods methods = 1;
+    AuthStrategyConfig config = 2;
+  }
+
+  optional uint64 messageId = 1;
+  optional string strategyName = 2;
+  optional string pluginName = 3;
+  AuthStrategy strategy = 4;
+}
+
+message RemoveAuthStrategy {
+  optional uint64 messageId = 1;
+  optional string strategyName = 2;
+  optional string pluginName = 3;
+}
+
+message DumpRequest {
+  optional uint64 messageId = 1;
+  optional string suffix = 2;
+}
+
+message ResetSecurity {
+  optional uint64 messageId = 1;
+}
+
+message Shutdown {
+  optional uint64 messageId = 1;
+}
+
+message RefreshValidators {
+  optional uint64 messageId = 1;
+}
+
+message InvalidateProfile {
+  optional uint64 messageId = 1;
+  optional string profileId = 2;
+}
+
+message InvalidateRole {
+  optional uint64 messageId = 1;
+  optional string roleId = 2;
+}
+
+message AddIndex {
+  optional uint64 messageId = 1;
+  optional string scope = 2;
+  optional string index = 3;
+}
+
+message AddCollection {
+  optional uint64 messageId = 1;
+  optional string scope = 2;
+  optional string index = 3;
+  optional string collection = 4;
+}
+
+message RemoveIndexes {
+  optional uint64 messageId = 1;
+  optional string scope = 2;
+  repeated string indexes = 3;
+}
+
+message RemoveCollection {
+  optional uint64 messageId = 1;
+  optional string scope = 2;
+  optional string index = 3;
+  optional string collection = 4;
+}
+
+message ClusterWideEvent {
+  optional uint64 messageId = 1;
+  optional string event = 2;
+  optional string payload = 3;
+}
+
+message RefreshIndexCache {
+  optional uint64 messageId = 1;
+}

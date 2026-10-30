@@ -1,0 +1,81 @@
+// messages definition for issuing node commands and receiving the
+// corresponding responses
+// /!\ Every singular scalar field is "optional": see sync.proto's header.
+package command;
+
+syntax="proto3";
+
+import "sync.proto";
+
+// Full state response
+message FullStateResponse {
+  // Describes the nodes that have subscribed to a given realtime room
+  message NodeSubscribers {
+    optional string nodeId = 1;
+    optional uint32 subscribers = 2;
+    optional uint64 messageId = 3;
+  }
+
+  // Describes a realtime room
+  message RealtimeRoom {
+    optional string roomId = 1;
+    optional string index = 2;
+    optional string collection = 3;
+
+    // array of polymorphic objects, needs to be stringified beforehand until
+    // this PR is merged: https://github.com/protobufjs/protobuf.js/pull/1495
+    optional string filters = 4;
+
+    repeated NodeSubscribers nodes = 5;
+  }
+
+  // Describes a cluster activity event
+  message Activity {
+    optional string id = 1;
+    optional string date = 2;
+    optional string address = 3;
+    optional uint32 event = 4;
+    optional string reason = 5;
+  }
+
+  message NodeState {
+    optional string id = 1;
+    optional uint64 lastMessageId = 2;
+  }
+
+  repeated RealtimeRoom rooms = 1;
+  repeated sync.NewAuthStrategy authStrategies = 2;
+  repeated Activity activity = 3;
+  repeated NodeState nodesState = 4;
+}
+
+// Handshake Request
+message HandshakeRequest {
+  optional string nodeId = 1;
+  optional uint64 lastMessageId = 2;
+  optional string ip = 3;
+}
+
+// Handshake response
+message HandshakeResponse {
+  optional bool added = 1;
+  optional uint64 lastMessageId = 2;
+}
+
+// Retransmit request: the messages a subscriber missed from this node's sync
+// stream, by message id, both ends included (#2785)
+message RetransmitRequest {
+  optional uint64 from = 1;
+  optional uint64 to = 2;
+}
+
+// Retransmit response: the missed messages, in order, exactly as they were
+// published (topic + encoded sync message)
+message RetransmitResponse {
+  message Frame {
+    optional string topic = 1;
+    optional bytes data = 2;
+  }
+
+  repeated Frame frames = 1;
+}

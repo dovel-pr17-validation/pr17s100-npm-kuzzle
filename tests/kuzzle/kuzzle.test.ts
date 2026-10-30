@@ -1,0 +1,1370 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import Bluebird from "bluebird";
+import stableStringify from "json-stable-stringify";
+
+import Kuzzle from "../../lib/kuzzle/kuzzle";
+import type { StartOptions } from "../../lib/types/Kuzzle";
+import Plugin from "../../lib/core/plugin/plugin";
+import kuzzleStateEnum from "../../lib/kuzzle/kuzzleStateEnum";
+import { loadConfig } from "../../lib/config";
+import { sha256 } from "../../lib/util/crypto";
+import { invalid } from "../helpers/invalid";
+import {
+  MutexAcquireError,
+  MutexLockLostError,
+  withLock,
+} from "../../lib/util/distributedLock";
+import { MutexStub, releaseAllLocksBeforeExit } from "./kuzzleFixture";
+import { present } from "../helpers/present";
+
+/**
+ * ⚠️ The Mocha spec rewired `koncorde_1` and `vault_1` — **the variable names
+ * `tsc` emits for two of this module's imports**. That is the plainest case in
+ * the suite of a test written against compiled output rather than against the
+ * subject, and it is why that spec could only ever run out of `dist/test`.
+ * `vi.mock` names the dependency instead, so this port is *simpler* than what
+ * it replaces.
+ */
+vi.mock("koncorde", async () => {
+  const { Koncorde } = await import("./kuzzleFixture");
+
+  return { Koncorde };
+});
+
+vi.mock("../../lib/kuzzle/vault", async () => {
+  const { vault } = await import("./kuzzleFixture");
+
+  return { default: vault };
+});
+
+vi.mock("../../lib/util/mutex", async () => ({
+  Mutex: (await import("./kuzzleFixture")).MutexStub,
+}));
+
+/**
+ * Every lock taken through `withLock`, in order, with what happened to it.
+ * `refused` lists the resources another node holds: those reject with the
+ * real `MutexAcquireError`, as `withLock` does. `lost` lists the resources
+ * whose lock is lost once its callback has run: those reject with the real
+ * `MutexLockLostError`.
+ */
+const locks = vi.hoisted(() => {
+  const taken: {
+    config: { retryAttempts?: number; ttl?: number } | undefined;
+    resource: string;
+  }[] = [];
+
+  return {
+    events: [] as string[],
+    lost: new Set<string>(),
+    refused: new Set<string>(),
+    taken,
+  };
+});
+
+vi.mock("../../lib/util/distributedLock", async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import("../../lib/util/distributedLock")>();
+
+  return {
+    ...original,
+    releaseAllLocksBeforeExit: (await import("./kuzzleFixture"))
+      .releaseAllLocksBeforeExit,
+    withLock: vi.fn(
+      async (
+        resource: string,
+        callback: () => Promise<unknown>,
+        config?: { retryAttempts?: number; ttl?: number },
+      ) => {
+        locks.taken.push({ config, resource });
+
+        if (locks.refused.has(resource)) {
+          throw new original.MutexAcquireError(resource, 1);
+        }
+
+        locks.events.push(`lock:${resource}`);
+
+        try {
+          const result = await callback();
+
+          if (locks.lost.has(resource)) {
+            throw new original.MutexLockLostError(resource);
+          }
+
+          return result;
+        } finally {
+          locks.events.push(`unlock:${resource}`);
+        }
+      },
+    ),
+  };
+});
+
+/** The five modules `start()` constructs and initialises, in place. */
+vi.mock("../../lib/core/cache/cacheEngine", async () => {
+  const { moduleStub } = await import("./kuzzleFixture");
+
+  return { default: moduleStub("cacheEngine") };
+});
+
+vi.mock("../../lib/core/storage/storageEngine", async () => {
+  const { moduleStub } = await import("./kuzzleFixture");
+
+  return { default: moduleStub("storageEngine") };
+});
+
+vi.mock("../../lib/core/realtime", async () => {
+  const { moduleStub } = await import("./kuzzleFixture");
+
+  return { default: moduleStub("realtime") };
+});
+
+vi.mock("../../lib/core/security", async () => {
+  const { moduleStub } = await import("./kuzzleFixture");
+
+  return { default: moduleStub("security") };
+});
+
+vi.mock("../../lib/cluster", async () => {
+  const { moduleStub } = await import("./kuzzleFixture");
+
+  return { default: moduleStub("cluster") };
+});
+
+type Internals = {
+  importTypes: Record<
+    string,
+    (
+      config: unknown,
+      status: { firstCall: boolean; initialized: boolean },
+    ) => Promise<void>
+  >;
+  persistHashedImport: (payload: Record<string, unknown>) => Promise<void>;
+};
+
+/** `funnel.remainingRequests` is a getter on the real funnel. */
+const funnelOf = (kuzzle: Kuzzle) =>
+  invalid<{ remainingRequests: number }>(kuzzle.funnel);
+
+const internalsOf = (kuzzle: Kuzzle) => invalid<Internals>(kuzzle);
+
+/**
+ * `json-stable-stringify` answers `undefined` for a value with no JSON form —
+ * `undefined` itself, a function — which none of the payloads below are. The
+ * subject hashes the same way, so saying it here keeps the expectations
+ * readable and fails on this line if a payload ever stops being serializable.
+ */
+function stable(value: unknown): string {
+  const json = stableStringify(value);
+
+  present(json, "the stable stringification");
+
+  return json;
+}
+
+describe("#kuzzle/Kuzzle", () => {
+  let kuzzle: Kuzzle;
+  let application: Plugin;
+  let config: ReturnType<typeof loadConfig>;
+  /** Every initialisation the fixture observes, in the order it happened. */
+  let order: string[];
+  let ask: ReturnType<typeof vi.fn>;
+  let answers: Map<string, unknown>;
+  let moduleInits: Map<string, ReturnType<typeof vi.fn>>;
+
+  /**
+   * A fresh Kuzzle, with every collaborator the tests drive replaced.
+   *
+   * ⚠️ `global.kuzzle` is an accessor whose setter throws on a second write
+   * (`lib/kuzzle/kuzzle.ts` installs it at module evaluation). Deleting the
+   * property turns the constructor's `global.kuzzle = this` into a plain
+   * assignment, which is what lets a spec build more than one instance —
+   * the same trick the Mocha spec used, stated here rather than buried in a
+   * helper called `_mockKuzzle`.
+   */
+  const buildKuzzle = (): Kuzzle => {
+    Reflect.deleteProperty(global, "kuzzle");
+
+    const built = new Kuzzle(config);
+    const track =
+      (name: string) =>
+      async (...args: unknown[]) => {
+        order.push(args[0] === undefined ? name : `${name}:${args[0]}`);
+
+        return undefined;
+      };
+
+    Object.assign(built, {
+      adminController: { init: vi.fn() },
+      ask,
+      debugger: { init: vi.fn(async () => undefined) },
+      dumpGenerator: { dump: vi.fn(async () => "/tmp/dump") },
+      emit: vi.fn(track("emit")),
+      entryPoint: {
+        dispatch: vi.fn(),
+        init: vi.fn(track("entryPoint.init")),
+        startListening: vi.fn(track("entryPoint.startListening")),
+      },
+      funnel: {
+        init: vi.fn(track("funnel.init")),
+        remainingRequests: 0,
+      },
+      internalIndex: {
+        init: vi.fn(track("internalIndex.init")),
+        refreshCollection: vi.fn(async () => undefined),
+        updateMapping: vi.fn(async () => undefined),
+      },
+      log: {
+        error: vi.fn(),
+        flush: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+      },
+      pipe: vi.fn(track("pipe")),
+      pluginsManager: {
+        application: undefined,
+        init: vi.fn(track("pluginsManager.init")),
+        routes: [],
+      },
+      router: { init: vi.fn(track("router.init")) },
+      statistics: { init: vi.fn(track("statistics.init")) },
+      tokenManager: { init: vi.fn(track("tokenManager.init")) },
+      validation: {
+        curateSpecification: vi.fn(track("validation.curateSpecification")),
+        init: vi.fn(track("validation.init")),
+      },
+    });
+
+    return built;
+  };
+
+  beforeEach(async () => {
+    const fixture = await import("./kuzzleFixture");
+
+    fixture.reset();
+    locks.taken.length = 0;
+    locks.events.length = 0;
+    locks.refused.clear();
+    locks.lost.clear();
+
+    order = [];
+    answers = new Map();
+    moduleInits = fixture.moduleInits;
+
+    ask = vi.fn(async (event: string, ...args: unknown[]) => {
+      order.push(`ask:${event}`);
+
+      for (const [key, answer] of answers) {
+        if (`${event}:${args.join(":")}`.startsWith(key)) {
+          return answer;
+        }
+      }
+
+      return undefined;
+    });
+
+    /* `loadConfig()` answers a shared object. */
+    config = JSON.parse(JSON.stringify(loadConfig()));
+
+    kuzzle = buildKuzzle();
+
+    application = new Plugin(invalid({ init: vi.fn() }), {
+      application: true,
+      name: "application",
+    });
+    application.openApi = invalid("openApi");
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(global, "kuzzle");
+    vi.restoreAllMocks();
+  });
+
+  it("should emit and listen to its own events", async () => {
+    const heard = new Promise<void>((resolve) => {
+      /* The emitter is the real one: `emit` above is the stub the start
+       * sequence is asserted through, so this test uses a fresh instance. */
+      const emitter = buildKuzzle();
+
+      Object.assign(emitter, { emit: Kuzzle.prototype.emit });
+      emitter.on("event", () => resolve());
+      emitter.emit("event");
+    });
+
+    await expect(heard).resolves.toBeUndefined();
+  });
+
+  describe("#start", () => {
+    beforeEach(() => {
+      kuzzle.install = vi.fn(async () => undefined);
+      kuzzle.loadInitialState = vi.fn(async () => undefined);
+    });
+
+    it("should initialise every component in order", async () => {
+      expect(kuzzle.state).toBe(kuzzleStateEnum.STARTING);
+
+      await kuzzle.start(
+        application,
+        invalid({
+          import: { something: "here" },
+          installations: [{ handler: () => {}, id: "foo" }],
+          support: { something: "here" },
+        }),
+      );
+
+      expect(order).toEqual([
+        "pipe:kuzzle:state:start",
+        "internalIndex.init",
+        "ask:core:storage:public:cache:reload",
+        "ask:core:storage:private:cache:reload",
+        "validation.init",
+        "tokenManager.init",
+        "funnel.init",
+        "statistics.init",
+        "validation.curateSpecification",
+        "entryPoint.init",
+        "pluginsManager.init",
+        "ask:core:security:verify",
+        "router.init",
+        "pipe:kuzzle:start",
+        "pipe:kuzzle:state:live",
+        "entryPoint.startListening",
+        "pipe:kuzzle:state:ready",
+        "emit:core:kuzzleStart",
+      ]);
+
+      expect(kuzzle.state).toBe(kuzzleStateEnum.RUNNING);
+    });
+
+    it("should hand the start options to what consumes them", async () => {
+      const options = invalid<StartOptions>({
+        import: { something: "here" },
+        installations: [{ handler: () => {}, id: "foo" }],
+        support: { something: "else" },
+      });
+
+      await kuzzle.start(application, options);
+
+      expect(kuzzle.loadInitialState).toHaveBeenCalledWith(
+        expect.objectContaining(options.import),
+        options.support,
+      );
+      expect(kuzzle.install).toHaveBeenCalledWith(options.installations);
+      expect(kuzzle.pluginsManager.application).toBe(application);
+    });
+
+    // @deprecated
+    it("should build Koncorde with the configured regexp engine", async () => {
+      const { Koncorde } = await import("./kuzzleFixture");
+
+      await kuzzle.start(application);
+
+      expect(Koncorde).toHaveBeenCalledWith(
+        expect.objectContaining({ regExpEngine: "re2" }),
+      );
+
+      const withPcre = buildKuzzle();
+
+      withPcre.install = vi.fn(async () => undefined);
+      withPcre.loadInitialState = vi.fn(async () => undefined);
+      withPcre.config.realtime.pcreSupport = true;
+
+      await withPcre.start(application);
+
+      expect(Koncorde).toHaveBeenLastCalledWith(
+        expect.objectContaining({ regExpEngine: "js" }),
+      );
+    });
+
+    it("should load the vault with the options it was given", async () => {
+      const { vault } = await import("./kuzzleFixture");
+
+      await kuzzle.start(application, {
+        secretsFile: "/secrets.json",
+        vaultKey: "the-key",
+      });
+
+      expect(vault.load).toHaveBeenCalledWith(
+        "the-key",
+        "/secrets.json",
+        config.vault?.newAlgorithm,
+      );
+    });
+
+    it("should register the process handlers it needs", async () => {
+      const on = vi.spyOn(process, "on").mockReturnValue(process);
+      const removeAllListeners = vi
+        .spyOn(process, "removeAllListeners")
+        .mockReturnValue(process);
+
+      await kuzzle.start(application);
+
+      /* Each signal is cleared of whatever held it before Kuzzle takes it —
+       * the Mocha spec asserted the two lists interleaved, call by call,
+       * which said the same thing at ten times the length. */
+      const signals = [
+        "unhandledRejection",
+        "uncaughtException",
+        "SIGQUIT",
+        "SIGABRT",
+        "SIGTRAP",
+        "SIGINT",
+        "SIGTERM",
+      ];
+
+      for (const signal of signals) {
+        expect(removeAllListeners).toHaveBeenCalledWith(signal);
+        expect(on).toHaveBeenCalledWith(signal, expect.any(Function));
+      }
+
+      expect(on).toHaveBeenCalledWith("exit", expect.any(Function));
+    });
+
+    it("should not initialise the cluster when it is disabled", async () => {
+      kuzzle.config.cluster.enabled = false;
+
+      await kuzzle.start(application, {});
+
+      expect(moduleInits.get("cluster")).not.toHaveBeenCalled();
+      expect(order).not.toContain("ask:core:storage:public:cache:reload");
+      expect(order).not.toContain("ask:core:storage:private:cache:reload");
+    });
+
+    it("should initialise the cluster when it is enabled", async () => {
+      kuzzle.config.cluster.enabled = true;
+
+      await kuzzle.start(application, {});
+
+      expect(moduleInits.get("cluster")).toHaveBeenCalled();
+    });
+
+    /* #3044: a node that joins late must see what a peer created in storage
+     * before its plugins' `init()` runs. */
+    it("should reload the storage caches after the cluster join, before the plugins init", async () => {
+      kuzzle.config.cluster.enabled = true;
+      moduleInits.get("cluster")?.mockImplementationOnce(async () => {
+        order.push("cluster.init");
+      });
+
+      await kuzzle.start(application, {});
+
+      const join = order.indexOf("cluster.init");
+      const plugins = order.indexOf("pluginsManager.init");
+
+      for (const scope of ["public", "private"]) {
+        const reload = order.indexOf(`ask:core:storage:${scope}:cache:reload`);
+
+        expect(reload, scope).toBeGreaterThan(join);
+        expect(reload, scope).toBeLessThan(plugins);
+      }
+
+      expect(join).toBeGreaterThan(-1);
+    });
+
+    /* #3020: a failed start left a node with no listener, still renewing its
+     * ID card, alive forever in production. */
+    describe("when it fails", () => {
+      let exit: ReturnType<typeof vi.spyOn>;
+      let events: string[];
+
+      beforeEach(() => {
+        events = [];
+        exit = vi.spyOn(process, "exit").mockImplementation(((code: number) => {
+          events.push(`exit:${code}`);
+        }) as never);
+        funnelOf(kuzzle).remainingRequests = 0;
+        kuzzle.install = vi.fn(async () => {
+          throw new Error("install failed");
+        });
+      });
+
+      it("hands the error to the caller, then shuts down with exit code 1", async () => {
+        await kuzzle.start(application).catch((error: Error) => {
+          events.push(`caught:${error.message}`);
+        });
+
+        await vi.waitFor(() => expect(exit).toHaveBeenCalled());
+
+        expect(events).toEqual(["caught:install failed", "exit:1"]);
+        expect(kuzzle.log.error).toHaveBeenCalledExactlyOnceWith(
+          expect.stringMatching(
+            /^\[X\] Cannot start Kuzzle .*: install failed$/,
+          ),
+        );
+        expect(releaseAllLocksBeforeExit).toHaveBeenCalledOnce();
+      });
+
+      it("still exits when that shutdown fails", async () => {
+        vi.mocked(kuzzle.pipe).mockImplementation(async (event: string) => {
+          if (event === "kuzzle:shutdown") {
+            throw new Error("redis is gone");
+          }
+
+          return undefined;
+        });
+
+        await expect(kuzzle.start(application)).rejects.toThrow(
+          "install failed",
+        );
+
+        await vi.waitFor(() => expect(exit).toHaveBeenCalledExactlyOnceWith(1));
+        expect(kuzzle.log.error).toHaveBeenCalledWith(
+          "[shutdown] Unable to shut down gracefully: redis is gone",
+        );
+      });
+    });
+  });
+
+  /* #3045: a SIGTERM during the startup started the shutdown, but the startup
+   * went on to take the installations lock; a node killed before its drain
+   * ended left that lock to the other nodes for its whole TTL. */
+  describe("#start, when a shutdown begins during the startup", () => {
+    let exit: ReturnType<typeof vi.spyOn>;
+    let drained: () => void;
+
+    /** Settles with "pending" when `promise` has not settled by then. */
+    const settledOrPending = (promise: Promise<unknown>) =>
+      Promise.race([
+        promise.then(
+          () => "resolved",
+          () => "rejected",
+        ),
+        new Promise((resolve) => setTimeout(() => resolve("pending"), 20)),
+      ]);
+
+    beforeEach(() => {
+      exit = vi.spyOn(process, "exit").mockImplementation(() => {
+        return undefined as never;
+      });
+      kuzzle.install = vi.fn(async () => undefined);
+      kuzzle.loadInitialState = vi.fn(async () => undefined);
+
+      // The shutdown waits for requests still running, as in the issue
+      funnelOf(kuzzle).remainingRequests = 2;
+      const drain = new Promise<void>((resolve) => {
+        drained = () => {
+          funnelOf(kuzzle).remainingRequests = 0;
+          resolve();
+        };
+      });
+      vi.spyOn(Bluebird, "delay").mockImplementation(
+        () => drain as unknown as Bluebird<void>,
+      );
+    });
+
+    it("stops before the next step, and leaves the end to the shutdown", async () => {
+      vi.mocked(kuzzle.pluginsManager.init).mockImplementation(async () => {
+        void kuzzle.shutdown();
+
+        return {};
+      });
+
+      const started = kuzzle.start(application);
+
+      expect(await settledOrPending(started)).toBe("pending");
+      expect(kuzzle.loadInitialState).not.toHaveBeenCalled();
+      expect(kuzzle.install).not.toHaveBeenCalled();
+      expect(kuzzle.entryPoint.startListening).not.toHaveBeenCalled();
+      expect(order).not.toContain("pipe:kuzzle:start");
+      expect(kuzzle.log.info).toHaveBeenCalledWith(
+        "[ℹ] Startup stopped: Kuzzle is shutting down",
+      );
+      expect(kuzzle.log.error).not.toHaveBeenCalled();
+      expect(kuzzle.state).toBe(kuzzleStateEnum.SHUTTING_DOWN);
+
+      drained();
+
+      await vi.waitFor(() => expect(exit).toHaveBeenCalled());
+      expect(exit).toHaveBeenCalledExactlyOnceWith(0);
+      expect(kuzzle.entryPoint.dispatch).toHaveBeenCalledOnce();
+      expect(releaseAllLocksBeforeExit).toHaveBeenCalledOnce();
+    });
+
+    it("does not take the installations lock when it comes after the imports", async () => {
+      Reflect.deleteProperty(kuzzle, "install");
+      answers.set("core:storage:private:document:exist", false);
+      const handler = vi.fn(async () => undefined);
+      vi.mocked(kuzzle.loadInitialState).mockImplementation(async () => {
+        void kuzzle.shutdown();
+      });
+
+      const started = kuzzle.start(
+        application,
+        invalid({ installations: [{ handler, id: "slow" }] }),
+      );
+
+      expect(await settledOrPending(started)).toBe("pending");
+      expect(locks.taken).toEqual([]);
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it("reports a step that fails because of it without a second shutdown", async () => {
+      vi.mocked(kuzzle.pluginsManager.init).mockImplementation(async () => {
+        void kuzzle.shutdown();
+
+        throw new Error("redis is gone");
+      });
+
+      const started = kuzzle.start(application);
+
+      expect(await settledOrPending(started)).toBe("pending");
+      expect(kuzzle.log.info).toHaveBeenCalledWith(
+        "[ℹ] Startup stopped: Kuzzle is shutting down (redis is gone)",
+      );
+      expect(kuzzle.log.error).not.toHaveBeenCalled();
+
+      drained();
+
+      // A requested shutdown: the failure it caused does not turn it into one
+      await vi.waitFor(() => expect(exit).toHaveBeenCalled());
+      expect(exit).toHaveBeenCalledExactlyOnceWith(0);
+    });
+  });
+
+  describe("#dumpAndExit", () => {
+    let exit: ReturnType<typeof vi.spyOn>;
+    let dump: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      exit = vi.spyOn(process, "exit").mockImplementation((() => {}) as never);
+      dump = invalid<{ dumpGenerator: { dump: ReturnType<typeof vi.fn> } }>(
+        kuzzle,
+      ).dumpGenerator.dump;
+      funnelOf(kuzzle).remainingRequests = 0;
+    });
+
+    /* #3020: it exited 0, so an `on-failure` restart policy left the node down. */
+    it("exits with code 1", async () => {
+      kuzzle.config.dump.enabled = false;
+
+      await kuzzle.dumpAndExit("uncaught-exception");
+
+      expect(dump).not.toHaveBeenCalled();
+      expect(exit).toHaveBeenCalledExactlyOnceWith(1);
+    });
+
+    it("dumps first when dumps are enabled", async () => {
+      kuzzle.config.dump.enabled = true;
+
+      await kuzzle.dumpAndExit("uncaught-exception");
+
+      expect(dump).toHaveBeenCalledExactlyOnceWith("uncaught-exception");
+      expect(dump.mock.invocationCallOrder[0]).toBeLessThan(
+        exit.mock.invocationCallOrder[0],
+      );
+      expect(exit).toHaveBeenCalledExactlyOnceWith(1);
+    });
+
+    it.each(["uncaughtException", "SIGQUIT", "SIGABRT"])(
+      "is what a %s leads to",
+      async (event) => {
+        const on = vi.spyOn(process, "on").mockReturnValue(process);
+        vi.spyOn(process, "removeAllListeners").mockReturnValue(process);
+        kuzzle.config.dump.enabled = false;
+
+        kuzzle.registerSignalHandlers();
+
+        const handler = on.mock.calls.find(([name]) => name === event);
+
+        present(handler, `the ${event} handler`);
+        (handler[1] as (error?: Error) => void)(new Error("boom"));
+
+        await vi.waitFor(() => expect(exit).toHaveBeenCalledExactlyOnceWith(1));
+      },
+    );
+  });
+
+  describe("#dump", () => {
+    it("should delegate to the dump generator", async () => {
+      await kuzzle.dump("a-suffix");
+
+      expect(
+        invalid<{ dumpGenerator: { dump: ReturnType<typeof vi.fn> } }>(kuzzle)
+          .dumpGenerator.dump,
+      ).toHaveBeenCalledExactlyOnceWith("a-suffix");
+    });
+
+    /* Nothing awaits the SIGTRAP dump: a failure left unhandled is an
+     * `unhandledRejection`, which stops Kuzzle in development mode (step 15,
+     * F-05). */
+    it("should log a SIGTRAP dump that fails", async () => {
+      const on = vi.spyOn(process, "on").mockReturnValue(process);
+      vi.spyOn(process, "removeAllListeners").mockReturnValue(process);
+      invalid<{ dumpGenerator: { dump: ReturnType<typeof vi.fn> } }>(
+        kuzzle,
+      ).dumpGenerator.dump.mockRejectedValueOnce(new Error("already dumping"));
+
+      kuzzle.registerSignalHandlers();
+
+      const sigtrap = on.mock.calls.find(([event]) => event === "SIGTRAP");
+
+      present(sigtrap, "the SIGTRAP handler");
+      (sigtrap[1] as () => void)();
+
+      await vi.waitFor(() =>
+        expect(kuzzle.log.error).toHaveBeenCalledWith(
+          "Unable to dump on SIGTRAP: already dumping",
+        ),
+      );
+    });
+  });
+
+  describe("#shutdown", () => {
+    let exit: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      exit = vi.spyOn(process, "exit").mockImplementation(() => {
+        return undefined as never;
+      });
+    });
+
+    it("should wait until the funnel has no request left", async () => {
+      /* Fake timers do not work with the async function under test, so the
+       * delay is replaced with a real, short one. */
+      const delay = vi
+        .spyOn(Bluebird, "delay")
+        .mockImplementation(
+          () =>
+            new Promise((resolve) =>
+              setTimeout(resolve, 10),
+            ) as unknown as Bluebird<void>,
+        );
+
+      funnelOf(kuzzle).remainingRequests = 1;
+      setTimeout(() => {
+        funnelOf(kuzzle).remainingRequests = 0;
+      }, 50);
+
+      await kuzzle.shutdown();
+
+      /* ⚠️ `calledWith("shutdown")` again matched a prefix: the subject
+       * dispatches `("shutdown", {})`, and the payload was unasserted. */
+      expect(kuzzle.entryPoint.dispatch).toHaveBeenCalledExactlyOnceWith(
+        "shutdown",
+        {},
+      );
+      expect(order).toContain("pipe:kuzzle:shutdown");
+      expect(delay.mock.calls.length).toBeGreaterThan(1);
+      // @deprecated
+      expect(order).toContain("emit:core:shutdown");
+      expect(exit).toHaveBeenCalledExactlyOnceWith(0);
+    });
+
+    it("should flush both loggers", async () => {
+      const flush = vi.fn(async () => undefined);
+
+      /* `log` lives on the application instance; `pluginsManager.application`
+       * is the `Plugin` wrapper around it, and the shutdown used to read
+       * `log` off the wrapper, which never has one (TD-51). */
+      kuzzle.pluginsManager.application = new Plugin(
+        invalid({ init: vi.fn(), log: { flush } }),
+        { application: true, name: "application" },
+      );
+      funnelOf(kuzzle).remainingRequests = 0;
+
+      await kuzzle.shutdown();
+
+      expect(flush).toHaveBeenCalledOnce();
+      expect(kuzzle.log.flush).toHaveBeenCalledOnce();
+    });
+
+    it("exits with the code it is given", async () => {
+      funnelOf(kuzzle).remainingRequests = 0;
+
+      await kuzzle.shutdown(1);
+
+      expect(exit).toHaveBeenCalledExactlyOnceWith(1);
+    });
+
+    /* F-13: a lock taken by a node that exits blocks the others for its ttl. */
+    it("frees its locks once the funnel is empty, and before exiting", async () => {
+      const delay = vi.spyOn(Bluebird, "delay").mockImplementation(() => {
+        funnelOf(kuzzle).remainingRequests = 0;
+
+        return Bluebird.resolve() as unknown as Bluebird<void>;
+      });
+      funnelOf(kuzzle).remainingRequests = 1;
+
+      await kuzzle.shutdown(1);
+
+      for (const releaseAll of [
+        MutexStub.releaseAllBeforeExit,
+        releaseAllLocksBeforeExit,
+      ]) {
+        const [release] = releaseAll.mock.invocationCallOrder;
+
+        expect(release).toBeGreaterThan(delay.mock.invocationCallOrder[0]);
+        expect(release).toBeLessThan(exit.mock.invocationCallOrder[0]);
+      }
+    });
+
+    /* #3017: `process.exit` fires the `exit` handler, which calls `shutdown()`
+     * again, and a stalled redis made a node evict itself dozens of times. */
+    it("runs once, however many times it is called", async () => {
+      funnelOf(kuzzle).remainingRequests = 0;
+
+      const first = kuzzle.shutdown();
+      const second = kuzzle.shutdown();
+
+      await Promise.all([first, second]);
+      await kuzzle.shutdown();
+
+      expect(kuzzle.entryPoint.dispatch).toHaveBeenCalledOnce();
+      expect(kuzzle.log.info).toHaveBeenCalledWith("Initiating shutdown...");
+      expect(
+        vi
+          .mocked(kuzzle.log.info)
+          .mock.calls.filter(
+            ([message]) => message === "Initiating shutdown...",
+          ),
+      ).toHaveLength(1);
+      expect(releaseAllLocksBeforeExit).toHaveBeenCalledOnce();
+      expect(exit).toHaveBeenCalledExactlyOnceWith(0);
+    });
+
+    it("exits non-zero when a call made during the shutdown reports a failure", async () => {
+      funnelOf(kuzzle).remainingRequests = 0;
+
+      // e.g. a SIGTERM, then a cluster eviction while it runs
+      await Promise.all([kuzzle.shutdown(), kuzzle.shutdown(1)]);
+
+      expect(exit).toHaveBeenCalledExactlyOnceWith(1);
+    });
+
+    /* Its callers fire it and forget it (signal handlers, cluster eviction,
+     * admin:shutdown): a failure was an unhandled rejection, and a requested
+     * shutdown then left the process up with its network layer closed. */
+    it("never rejects: a failure is logged and the process exits with 1", async () => {
+      funnelOf(kuzzle).remainingRequests = 0;
+      vi.mocked(kuzzle.pipe).mockImplementation(async (event: string) => {
+        if (event === "kuzzle:shutdown") {
+          throw new Error("redis is gone");
+        }
+
+        return undefined;
+      });
+
+      await expect(kuzzle.shutdown()).resolves.toBeUndefined();
+
+      expect(kuzzle.log.error).toHaveBeenCalledWith(
+        "[shutdown] Unable to shut down gracefully: redis is gone",
+      );
+      expect(exit).toHaveBeenCalledExactlyOnceWith(1);
+    });
+
+    describe("when it does not finish", () => {
+      beforeEach(() => {
+        vi.useFakeTimers();
+        funnelOf(kuzzle).remainingRequests = 0;
+        // e.g. a plugin's `kuzzle:shutdown` pipe that never settles
+        vi.spyOn(kuzzle, "pipe").mockReturnValue(new Promise(() => undefined));
+      });
+
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it("exits anyway after 30s when it was caused by a failure", async () => {
+        void kuzzle.shutdown(1);
+
+        await vi.advanceTimersByTimeAsync(29999);
+        expect(exit).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(exit).toHaveBeenCalledExactlyOnceWith(1);
+        expect(kuzzle.log.error).toHaveBeenCalledWith(
+          "[shutdown] Not finished after 30000ms: exiting now",
+        );
+      });
+
+      it("keeps waiting when it was requested", async () => {
+        void kuzzle.shutdown();
+
+        await vi.advanceTimersByTimeAsync(60000);
+
+        expect(exit).not.toHaveBeenCalled();
+      });
+
+      it("starts the delay at the first failure reported during a requested one", async () => {
+        void kuzzle.shutdown();
+        await vi.advanceTimersByTimeAsync(10000);
+        void kuzzle.shutdown(1);
+
+        await vi.advanceTimersByTimeAsync(29999);
+        expect(exit).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(exit).toHaveBeenCalledExactlyOnceWith(1);
+      });
+    });
+
+    it("does not leave the delay running once it has finished", async () => {
+      vi.useFakeTimers();
+
+      try {
+        funnelOf(kuzzle).remainingRequests = 0;
+
+        await kuzzle.shutdown(1);
+        expect(exit).toHaveBeenCalledOnce();
+
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(exit).toHaveBeenCalledOnce();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("#install", () => {
+    let handler: ReturnType<typeof vi.fn<() => Promise<void>>>;
+
+    beforeEach(() => {
+      handler = vi.fn<() => Promise<void>>(async () => undefined);
+      vi.spyOn(Date, "now").mockReturnValue(1758585600000);
+    });
+
+    it("should run an installation that never ran, and record it", async () => {
+      answers.set("core:storage:private:document:exist", false);
+
+      await kuzzle.install([{ description: "description", handler, id: "id" }]);
+
+      expect(ask).toHaveBeenCalledWith(
+        "core:storage:private:document:exist",
+        "kuzzle",
+        "installations",
+        "id",
+      );
+      expect(ask).toHaveBeenCalledWith(
+        "core:storage:private:document:create",
+        "kuzzle",
+        "installations",
+        {
+          description: "description",
+          handler: handler.toString(),
+          installedAt: Date.now(),
+        },
+        { id: "id" },
+      );
+      expect(handler).toHaveBeenCalledOnce();
+      expect(kuzzle.log.info).toHaveBeenCalledOnce();
+    });
+
+    /* As the `Mutex` it replaces: a node waits for as long as another one
+     * runs the installations. */
+    it("should run the installations under a lock with no retry limit", async () => {
+      answers.set("core:storage:private:document:exist", false);
+
+      await kuzzle.install([{ handler, id: "id" }]);
+
+      expect(locks.taken).toEqual([
+        {
+          config: { retryAttempts: Number.POSITIVE_INFINITY },
+          resource: "backend:installations",
+        },
+      ]);
+      expect(locks.events).toEqual([
+        "lock:backend:installations",
+        "unlock:backend:installations",
+      ]);
+    });
+
+    /* #3045: the lock may come once the node holding it is done, long after
+     * this one was asked to stop. */
+    it("should give the lock back at once when the shutdown began meanwhile", async () => {
+      answers.set("core:storage:private:document:exist", false);
+      vi.mocked(withLock).mockImplementationOnce(async (_key, callback) => {
+        invalid<{ _state: kuzzleStateEnum }>(kuzzle)._state =
+          kuzzleStateEnum.SHUTTING_DOWN;
+
+        return callback();
+      });
+
+      await expect(kuzzle.install([{ handler, id: "id" }])).rejects.toThrow(
+        "Kuzzle is shutting down",
+      );
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(ask).not.toHaveBeenCalled();
+    });
+
+    it("should skip an installation that already ran", async () => {
+      answers.set("core:storage:private:document:exist", true);
+
+      await kuzzle.install([{ handler, id: "id" }]);
+
+      expect(ask).toHaveBeenCalledWith(
+        "core:storage:private:document:exist",
+        "kuzzle",
+        "installations",
+        "id",
+      );
+      expect(ask).not.toHaveBeenCalledWith(
+        "core:storage:private:document:create",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(handler).not.toHaveBeenCalled();
+      expect(kuzzle.log.info).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("#loadInitialState", () => {
+    let toImport: Record<string, unknown>;
+    let toSupport: Record<string, unknown>;
+    const payload = { something: "here" };
+
+    beforeEach(() => {
+      toImport = {
+        mappings: payload,
+        onExistingUsers: "skip",
+        profiles: payload,
+        roles: payload,
+        userMappings: payload,
+        users: payload,
+      };
+
+      toSupport = {
+        fixtures: payload,
+        mappings: payload,
+        securities: { profiles: payload, roles: payload, user: payload },
+      };
+    });
+
+    it("should import mappings and permissions, and record their hashes", async () => {
+      await kuzzle.loadInitialState(toImport, {});
+
+      expect(ask).toHaveBeenCalledWith(
+        "core:cache:internal:store",
+        "backend:init:import:mappings",
+        sha256(stable({ toImport: { mappings: payload }, toSupport: {} })),
+      );
+      expect(ask).toHaveBeenCalledWith(
+        "core:cache:internal:store",
+        "backend:init:import:permissions",
+        sha256(
+          stable({
+            toImport: { profiles: payload, roles: payload, users: payload },
+            toSupport: {},
+          }),
+        ),
+      );
+
+      expect(kuzzle.internalIndex.updateMapping).toHaveBeenCalledWith(
+        "users",
+        payload,
+      );
+      expect(kuzzle.internalIndex.refreshCollection).toHaveBeenCalledWith(
+        "users",
+      );
+      expect(ask).toHaveBeenCalledWith(
+        "core:storage:public:mappings:import",
+        payload,
+        { indexCacheOnly: false, propagate: false, refresh: true },
+      );
+      expect(ask).toHaveBeenCalledWith(
+        "core:security:load",
+        { profiles: payload, roles: payload, users: payload },
+        {
+          onExistingUsers: "skip",
+          onExistingUsersWarning: true,
+          refresh: "wait_for",
+        },
+      );
+    });
+
+    it("should import support mappings, fixtures and securities", async () => {
+      await kuzzle.loadInitialState({}, toSupport);
+
+      expect(ask).toHaveBeenCalledWith(
+        "core:storage:public:mappings:import",
+        payload,
+        {
+          indexCacheOnly: false,
+          propagate: false,
+          rawMappings: true,
+          refresh: true,
+        },
+      );
+      expect(ask).toHaveBeenCalledWith(
+        "core:storage:public:document:import",
+        payload,
+      );
+      expect(ask).toHaveBeenCalledWith(
+        "core:security:load",
+        toSupport.securities,
+        {
+          force: true,
+          refresh: "wait_for",
+        },
+      );
+    });
+
+    it.each([
+      ["mappings", { mappings: payload }],
+      ["permissions", { securities: { roles: payload } }],
+    ])(
+      "should refuse %s coming from import and support at once",
+      async (_name, support) => {
+        await expect(
+          kuzzle.loadInitialState(
+            { mappings: payload, profiles: payload },
+            support,
+          ),
+        ).rejects.toMatchObject({ id: "plugin.runtime.incompatible" });
+      },
+    );
+
+    describe("bookkeeping", () => {
+      beforeEach(() => {
+        internalsOf(kuzzle).persistHashedImport = vi.fn<
+          (payload: Record<string, unknown>) => Promise<void>
+        >(async () => undefined);
+      });
+
+      it.each([
+        ["neither Redis nor ES holds a hash", null, false, false],
+        ["ES holds a hash and Redis does not", null, true, false],
+        ["Redis holds a hash and ES does not", "123", false, false],
+        ["Redis holds the current hash", "current", true, true],
+      ])(
+        "should persist the payload hash when %s",
+        async (_name, redisHash, existingESHash, initialized) => {
+          const importPayloadHash = sha256(
+            stable({ toImport: { mappings: payload }, toSupport: {} }),
+          );
+          const existingRedisHash =
+            redisHash === "current" ? importPayloadHash : redisHash;
+          answers.set("core:cache:internal:get", existingRedisHash);
+          answers.set("core:storage:private:document:exist", existingESHash);
+          answers.set("core:storage:private:document:get", {
+            _source: { hash: "123" },
+          });
+
+          await kuzzle.loadInitialState(toImport, {});
+
+          expect(
+            vi.mocked(internalsOf(kuzzle).persistHashedImport),
+          ).toHaveBeenCalledWith({
+            existingESHash,
+            existingRedisHash,
+            importPayloadHash,
+            initialized,
+            type: "mappings",
+          });
+        },
+      );
+
+      it("should not import once the shutdown began", async () => {
+        invalid<{ _state: kuzzleStateEnum }>(kuzzle)._state =
+          kuzzleStateEnum.SHUTTING_DOWN;
+
+        await expect(kuzzle.loadInitialState(toImport, {})).rejects.toThrow(
+          "Kuzzle is shutting down",
+        );
+
+        expect(ask).not.toHaveBeenCalled();
+        expect(locks.events).toEqual([
+          "lock:backend:import:fixtures",
+          "unlock:backend:import:fixtures",
+        ]);
+      });
+
+      /* TD-69 (#2782): the two reads used to happen before `mutex.lock()`, so
+       * the holder decided from a snapshot another node could already have
+       * invalidated, and then created a document that existed. */
+      it("should read the bookkeeping only after taking the lock", async () => {
+        answers.set("core:cache:internal:get", null);
+        answers.set("core:storage:private:document:exist", false);
+
+        await kuzzle.loadInitialState(toImport, {});
+
+        const locked = vi.mocked(withLock).mock.invocationCallOrder.at(-1);
+        const read = ask.mock.invocationCallOrder.at(-1);
+
+        expect(locked).toBeLessThan(read!);
+        expect(order.at(-2)).toBe("ask:core:cache:internal:get");
+      });
+
+      /* #3003: a node waits, with no limit, for the node running an import,
+       * instead of carrying on before the import is done. The lock is
+       * refreshed while held; the TTL bounds a node that dies. */
+      it("should wait for each import lock with no retry limit", async () => {
+        await kuzzle.loadInitialState(toImport, {});
+
+        expect(locks.taken).toEqual(
+          ["fixtures", "mappings", "permissions", "userMappings"].map(
+            (type) => ({
+              config: { retryAttempts: Number.POSITIVE_INFINITY, ttl: 60000 },
+              resource: `backend:import:${type}`,
+            }),
+          ),
+        );
+      });
+
+      /* Each type's lock wraps the remaining types: every lock is held until
+       * all the imports are done, then released innermost first, so a node
+       * waiting for the first one starts after every import. */
+      it("should hold every import lock until the imports are done", async () => {
+        internalsOf(kuzzle).importTypes.userMappings = async () => {
+          locks.events.push("import:userMappings");
+        };
+
+        await kuzzle.loadInitialState(toImport, {});
+
+        expect(locks.events).toEqual([
+          "lock:backend:import:fixtures",
+          "lock:backend:import:mappings",
+          "lock:backend:import:permissions",
+          "lock:backend:import:userMappings",
+          "import:userMappings",
+          "unlock:backend:import:userMappings",
+          "unlock:backend:import:permissions",
+          "unlock:backend:import:mappings",
+          "unlock:backend:import:fixtures",
+        ]);
+      });
+
+      /* The node that gets the lock after the importing one finds the
+       * import done for this payload: it only fills its cache. */
+      it("should only fill the cache when the import is already done", async () => {
+        const importMappings = vi.fn(async () => undefined);
+        internalsOf(kuzzle).importTypes.mappings = importMappings;
+        answers.set(
+          "core:cache:internal:get",
+          sha256(stable({ toImport: { mappings: payload }, toSupport: {} })),
+        );
+
+        await kuzzle.loadInitialState(toImport, {});
+
+        expect(importMappings).toHaveBeenCalledWith(
+          { toImport, toSupport: {} },
+          { firstCall: false, initialized: true },
+        );
+      });
+
+      /* A hash left by another payload is not "done": the import runs. */
+      it("should import again when the payload changed", async () => {
+        const importMappings = vi.fn(async () => undefined);
+        internalsOf(kuzzle).importTypes.mappings = importMappings;
+        answers.set("core:cache:internal:get", "previous-payload-hash");
+        answers.set("core:storage:private:document:exist", true);
+
+        await kuzzle.loadInitialState(toImport, {});
+
+        expect(importMappings).toHaveBeenCalledWith(
+          { toImport, toSupport: {} },
+          { firstCall: true, initialized: false },
+        );
+      });
+
+      /* A lost lock fails the startup instead of carrying on unprotected. */
+      it("should fail when an import lock is lost", async () => {
+        const importMappings = vi.fn(async () => undefined);
+        internalsOf(kuzzle).importTypes.mappings = importMappings;
+        locks.lost.add("backend:import:mappings");
+
+        await expect(
+          kuzzle.loadInitialState(toImport, {}),
+        ).rejects.toBeInstanceOf(MutexLockLostError);
+        expect(importMappings).toHaveBeenCalledOnce();
+      });
+
+      /* An import failing with a lock error of its own fails the startup,
+       * and is not run a second time. */
+      it("should fail on a MutexAcquireError thrown by an import", async () => {
+        const failure = new MutexAcquireError("some other lock", 1);
+        const importMappings = vi.fn(async () => {
+          throw failure;
+        });
+        internalsOf(kuzzle).importTypes.mappings = importMappings;
+
+        await expect(kuzzle.loadInitialState(toImport, {})).rejects.toBe(
+          failure,
+        );
+        expect(importMappings).toHaveBeenCalledOnce();
+        expect(locks.events).toContain("unlock:backend:import:mappings");
+      });
+    });
+
+    describe("#persistHashedImport", () => {
+      const record = (hash: string) => [
+        "core:storage:private:document:createOrReplace",
+        "kuzzle",
+        "imports",
+        "backend:init:import:mappings",
+        { hash },
+      ];
+      const cache = (hash: string) => [
+        "core:cache:internal:store",
+        "backend:init:import:mappings",
+        hash,
+      ];
+
+      /* The id is fixed, so a conflict means another node initialized the same
+       * import — convergence, not an error. `create` made it kill startup. */
+      it("should write with createOrReplace", async () => {
+        await internalsOf(kuzzle).persistHashedImport({
+          existingESHash: false,
+          existingRedisHash: null,
+          importPayloadHash: "hash",
+          initialized: false,
+          type: "mappings",
+        });
+
+        expect(ask).toHaveBeenCalledWith(...record("hash"));
+        expect(ask).toHaveBeenCalledWith(...cache("hash"));
+        expect(ask).not.toHaveBeenCalledWith(
+          "core:storage:private:document:create",
+          expect.anything(),
+          expect.anything(),
+          expect.anything(),
+          expect.anything(),
+        );
+      });
+
+      /* #3003: the hash of a previous payload used to stay, so every start
+       * imported the new payload again. */
+      it("should replace the hashes of a previous payload", async () => {
+        await internalsOf(kuzzle).persistHashedImport({
+          existingESHash: true,
+          existingRedisHash: "previous",
+          importPayloadHash: "hash",
+          initialized: false,
+          type: "mappings",
+        });
+
+        expect(ask).toHaveBeenCalledWith(...record("hash"));
+        expect(ask).toHaveBeenCalledWith(...cache("hash"));
+      });
+
+      it("should only fill in the side missing the current hash", async () => {
+        await internalsOf(kuzzle).persistHashedImport({
+          existingESHash: false,
+          existingRedisHash: "hash",
+          importPayloadHash: "hash",
+          initialized: true,
+          type: "mappings",
+        });
+
+        expect(ask).toHaveBeenCalledWith(...record("hash"));
+        expect(ask).not.toHaveBeenCalledWith(...cache("hash"));
+      });
+
+      it("should write nothing when both hold the current hash", async () => {
+        await internalsOf(kuzzle).persistHashedImport({
+          existingESHash: true,
+          existingRedisHash: "hash",
+          importPayloadHash: "hash",
+          initialized: true,
+          type: "mappings",
+        });
+
+        expect(ask).not.toHaveBeenCalledWith(...record("hash"));
+        expect(ask).not.toHaveBeenCalledWith(...cache("hash"));
+      });
+    });
+  });
+});

@@ -1,0 +1,97 @@
+# Node
+node_modules
+npm-debug.log*
+.node_history
+.reify-cache
+
+# Exclude coverage report
+coverage
+.nyc_output
+
+# Plugin config folder
+config/plugins/
+/dump
+
+# IDE
+.idea
+
+# Docker
+docker-compose-custom.yml
+
+# vagrant
+/.vagrant
+
+# Other
+.DS_STORE
+*#
+*~
+.*.swp
+.tags
+
+# Kuzzle
+.kuzzlerc
+/*.log
+
+#swagger
+kuzzle-swagger.*
+
+#sonarqube
+.sonar
+.scannerwork
+.sonarlint
+/sonarlint.json
+
+#plugins
+plugins/available/*
+!plugins/available/functional-test-plugin
+!plugins/available/kuzzle-plugin-cluster
+
+plugins/enabled/*
+!plugins/enabled/.keep
+
+#secrets files
+config/secrets.json
+config/testsecrets.json
+config/testsecrets.enc.json
+
+config/kuzzlerc
+
+#tests files
+index-dump/*
+
+#doc framework
+doc/framework
+frontmatter-errors.json
+# The error-code pages `doc/build-error-codes` writes, at the repo root.
+# Unanchored, this pattern also swallowed `tests/kerror/codes/` — a spec
+# directory that mirrors `lib/kerror/codes/`, silently.
+/codes/
+
+#vscode
+.vscode
+
+# version upgrades
+upgrade-*.report
+
+# JS generated files from TS
+*.d.ts
+# ...except hand-written declarations. `outDir` is `dist/` (ignored below), so tsc
+# never emits into either directory — anything matching these is something someone
+# wrote. Was a per-file exception for `Global.d.ts`, which is `Global.ts` now.
+#
+# `lib/types/` declares untyped runtime dependencies of the PRODUCTION code;
+# `tests/types/` declares those of the TEST code, and the distinction is load-
+# bearing rather than tidy: nothing in `lib/` may import a test dependency, and
+# `should` — which outlived the Mocha suite as cucumber's assertion library
+# (ADR-0001 step 13, L7a) — is the first one that needed saying (step 14, M0).
+!lib/types/*.d.ts
+!tests/types/*.d.ts
+*.js.map
+
+# NPM package
+package/*
+kuzzle-*.tgz
+
+vitest.config.js
+
+dist

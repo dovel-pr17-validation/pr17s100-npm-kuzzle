@@ -1,0 +1,42 @@
+---
+code: true
+type: page
+title: off | Framework | Core
+
+description: BackendCluster.off method
+---
+
+# `off()`
+
+<SinceBadge version="2.9.0" />
+
+Unregisters a listener.
+
+If multiple instances of the same listener are registered, only the first one is removed.
+
+::: info
+This method can only be used once the application is started.
+:::
+
+```ts
+off (event: string, listener: ClusterEventHandler): Promise<void>
+```
+
+<br/>
+
+| Argument | Type                  | Description                   |
+|----------|-----------------------|-------------------------------|
+| `event` | <pre>string</pre> | Event name |
+| `listener` | <pre>[ClusterEventHandler](/core/2/framework/types/event-handler)</pre> | Listener function to remove. |
+
+## Usage
+
+```js
+function listener (payload) {
+  // ... listener code ...
+}
+
+await app.cluster.on('some:event', listener);
+
+await app.cluster.off('some:event', listener);
+```

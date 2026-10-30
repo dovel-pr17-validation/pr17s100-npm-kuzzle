@@ -1,0 +1,196 @@
+/**
+ * Less travelled corners of the API, written the way v2.56.0's declarations
+ * let code be written: complete configuration objects, untyped arguments,
+ * results read or assigned without narrowing.
+ */
+
+import type {
+  IKuzzleConfiguration,
+  JSONObject,
+  PluginHookDefinition,
+  PluginPipeDefinition,
+  SecurityConfiguration,
+  Store,
+} from "kuzzle";
+import {
+  Backend,
+  Connection,
+  Headers,
+  Inflector,
+  KuzzleRequest,
+  ObjectRepository,
+  QueryTranslator,
+  RequestContext,
+  RequestInput,
+  RequestResponse,
+  cacheDbEnum,
+} from "kuzzle";
+// A deep import: `Profile` is the SDK's at the package root.
+import { Profile } from "kuzzle/dist/lib/model/security/profile";
+
+const app = new Backend("typings");
+
+// T-12: configuration objects built without the members v2.56.0 lacked.
+export function complete(
+  content: Omit<IKuzzleConfiguration, "version" | "vault">,
+): IKuzzleConfiguration {
+  return content;
+}
+export const internal: IKuzzleConfiguration["internal"] = {
+  hash: null,
+  notifiableProtocols: [],
+};
+export const cluster: IKuzzleConfiguration["cluster"] = {
+  activityDepth: 50,
+  enabled: true,
+  heartbeat: 2000,
+  interface: null,
+  ip: "private",
+  ipv6: false,
+  joinTimeout: 60000,
+  minimumNodes: 1,
+  ports: { command: 7511, sync: 7510 },
+  syncTimeout: 5000,
+};
+
+// TD-19: the config members v2.56.0 declared `any`, read without narrowing.
+export function untypedSections(config: IKuzzleConfiguration) {
+  const iface: string = config.cluster.interface;
+  const seed: Buffer = config.internal.hash.seed;
+  const routes: Array<{ path: string }> = config.http.routes;
+  const node: string = config.services.storageEngine.client.node;
+
+  return { iface, node, routes, seed };
+}
+
+// T-14: a security section without the deprecated `jwt`.
+export function security(
+  section: Omit<SecurityConfiguration, "jwt">,
+): SecurityConfiguration {
+  return section;
+}
+
+// T-16 and T-17: untyped constructor arguments, header setters' answers.
+export function response(raw: unknown, request: KuzzleRequest): void {
+  const built = new RequestResponse(raw);
+  const set: string = request.response.setHeader("x-a", "b");
+
+  app.log.debug(`${built.status} ${set}`);
+
+  return request.response.removeHeader("x-a");
+}
+export const input = (raw: unknown) => new RequestInput(raw);
+
+// T-22: a wrapped error manager, handed an untyped name.
+const wrapped = app.errors.wrap("app", "api");
+export const wrappedErrors = (name: unknown, caught: unknown) => [
+  wrapped.get(name),
+  wrapped.getFrom(caught, name),
+];
+export const rejected: Promise<string> = wrapped.reject("custom");
+
+// T-24: reading a hook or pipe definition back, and calling it.
+export async function replay(
+  hooks: PluginHookDefinition,
+  pipes: PluginPipeDefinition,
+  request: KuzzleRequest,
+) {
+  const hook = hooks["document:afterCreate"];
+  if (hook !== undefined && !Array.isArray(hook)) {
+    await hook(request);
+  }
+
+  const pipe = pipes["document:beforeCreate"];
+  if (pipe !== undefined && !Array.isArray(pipe)) {
+    return pipe(request);
+  }
+
+  return request;
+}
+
+// T-26: a repository with a store of its own, read without narrowing.
+type Driver = { _id: string; name: string };
+
+export class LegacyDriverRepository extends ObjectRepository<Driver> {
+  constructor(store: unknown) {
+    super({ cache: cacheDbEnum.NONE, store });
+    this.collection = "drivers";
+  }
+
+  async report() {
+    const found = await this.search({ query: {} }, { size: 10 });
+    const byName: JSONObject = found.aggregations.byName;
+    const names: Array<{ name: string }> = found.hits;
+    const scrollId: string = found.scrollId;
+    const next = await this.scroll(scrollId, "1m");
+    const deleted: { count: number } = await this.truncate(undefined);
+
+    return { byName, deleted, names, next: next.total };
+  }
+
+  serializeToDatabase(driver: Driver): Omit<Driver, "_id"> {
+    return { name: driver.name };
+  }
+
+  stored(driver: Driver): Omit<Driver, "_id"> {
+    return super.serializeToDatabase(driver);
+  }
+}
+
+// T-31 and T-32: untyped arguments, answers assigned to one's own types.
+export const query: { bool: JSONObject } = new QueryTranslator().translate(
+  JSON.parse("{}") as unknown,
+);
+export const camel: string = Inflector.camelCase(42 as unknown);
+
+// Profile._hash, v2.56.0's `() => boolean`.
+export const unpatched: boolean = Profile._hash();
+
+// TD-11: a `Store`'s answers, read and assigned without narrowing.
+export async function storeAnswers(store: Store, filters: unknown) {
+  const count: number = await store.count("drivers", filters);
+  const found: { hits: Driver[] } = await store.search("drivers", filters);
+  const next: { total: number } = await store.scroll(found, "1m");
+  const created: Driver[] = await store.createCollections({});
+
+  return { count, created, found, next: next.total };
+}
+
+// TD-15: building a request out of untyped values, then reading its result,
+// headers and connection details without narrowing.
+export function untypedRequest(data: unknown, options: unknown) {
+  const request = new KuzzleRequest(data, options);
+  const context = new RequestContext(options);
+  const connection = new Connection(options);
+
+  request.setResult(data);
+  request.response.result = options;
+  request.input.body = [data];
+
+  const result: { total: number } = request.result;
+  const answered: string[] = request.response.result;
+  const proxied: string = request.response.headers["x-a"];
+  const header: string | undefined = new Headers().getHeader(data);
+  const misc: number = connection.misc.port;
+  const tags: string[] = request.getArray("tags");
+  const ids: JSONObject = request.getArrayFromBodyOrArgs("ids", "a,b");
+
+  return { answered, context, header, ids, misc, proxied, result, tags };
+}
+
+// TD-02: untyped values handed to the application's logger, config and
+// pipes, and the members still declared `any` read without narrowing.
+export function untypedApplication(raw: unknown) {
+  app.log.info(raw);
+  app.log.error(raw);
+  app.config.set("limits.documentsFetchCount", raw);
+  app.pipe.register("custom:event", async (payload: JSONObject) => payload, {
+    dynamic: true,
+    name: "custom",
+  });
+
+  const client: { ping(): Promise<boolean> } = app.storage.storageClient;
+  const appError: Error = app.kerror.get("some_error", raw);
+
+  return { appError, client };
+}
